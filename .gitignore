@@ -1,0 +1,14 @@
+# Variáveis de ambiente e credenciais
+.env
+
+# Arquivos temporários do Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs
+.vscode/
+.idea/
+.venv/
+env/
+venv/
