@@ -6,6 +6,9 @@ import requests
 from typing import List, Dict, Any
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from colorama import Fore, Style, init as colorama_init
 
 try:
     from dotenv import load_dotenv
@@ -13,11 +16,36 @@ try:
 except ImportError:
     pass
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-    datefmt="%H:%M:%S",
-)
+colorama_init(autoreset=True)
+
+
+class ColorFormatter(logging.Formatter):
+    LEVEL_COLORS = {
+        logging.DEBUG: Fore.CYAN,
+        logging.INFO: Fore.GREEN,
+        logging.WARNING: Fore.YELLOW,
+        logging.ERROR: Fore.RED,
+        logging.CRITICAL: Fore.RED + Style.BRIGHT,
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = self.LEVEL_COLORS.get(record.levelno, "")
+        timestamp = f"{Style.DIM}{self.formatTime(record, '%H:%M:%S')}{Style.RESET_ALL}"
+        level = f"{color}{Style.BRIGHT}{record.levelname:<8}{Style.RESET_ALL}"
+        return f"{timestamp} {level} {record.getMessage()}"
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(ColorFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
+
+
+def banner(text: str, color: str = Fore.CYAN) -> None:
+    line = "═" * 60
+    print(f"\n{color}{Style.BRIGHT}{line}")
+    print(f"  {text}")
+    print(f"{line}{Style.RESET_ALL}\n")
+
 
 TARGET_URL = "https://editorafundamento.com.br/"
 PAGES_TO_CHECK = [
@@ -30,27 +58,53 @@ PAGES_TO_CHECK = [
 ]
 
 
-def check_page(url: str) -> Dict[str, Any]:
-    logging.info(f"Auditando: {url}")
+def check_page(driver: webdriver.Chrome, url: str) -> Dict[str, Any]:
+    logging.info(f"{Fore.CYAN}Auditando: {Style.BRIGHT}{url}")
+
+    status_code = "Desconhecido"
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
-        start = time.time()
         req = requests.get(url, headers=headers, timeout=10)
-        elapsed = round(time.time() - start, 2)
-        return {"url": url, "status": req.status_code, "load_time_seconds": elapsed}
+        status_code = req.status_code
     except requests.RequestException as e:
-        logging.error(f"Erro ao acessar {url}: {e}")
-        return {"url": url, "status": f"Erro: {e}", "load_time_seconds": 0}
+        status_code = f"Erro: {e}"
+        logging.error(f"HTTP falhou em {url}: {e}")
+
+    start_time = time.time()
+    try:
+        driver.get(url)
+    except Exception as e:
+        logging.error(f"Selenium falhou em {url}: {e}")
+        return {"url": url, "status": status_code, "load_time_seconds": 0}
+
+    load_time = round(time.time() - start_time, 2)
+    time.sleep(3)
+
+    return {"url": url, "status": status_code, "load_time_seconds": load_time}
 
 
 def run_audit() -> List[Dict[str, Any]]:
     results = []
-    results.append(check_page(TARGET_URL))
-    for path in PAGES_TO_CHECK:
-        full_url = TARGET_URL.rstrip("/") + "/" + path.lstrip("/")
-        results.append(check_page(full_url))
+
+    chrome_options = Options()
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.set_window_rect(x=0, y=0, width=960, height=1040)
+
+    try:
+        logging.info(f"{Fore.MAGENTA}Página principal: {Style.BRIGHT}{TARGET_URL}")
+        results.append(check_page(driver, TARGET_URL))
+
+        for path in PAGES_TO_CHECK:
+            full_url = TARGET_URL.rstrip("/") + "/" + path.lstrip("/")
+            results.append(check_page(driver, full_url))
+    finally:
+        driver.quit()
+
     return results
 
 
@@ -77,8 +131,9 @@ def send_email_report(results: List[Dict[str, Any]]) -> None:
 
     for r in results:
         flag = "OK" if str(r.get("status")) == "200" else "ERRO"
-        text_body += f"- {r['url']}: {flag} ({r['status']})\n"
-        html_body += f"<li><strong>{r['url']}</strong> — {flag} ({r['status']})</li>"
+        load = f" | {r['load_time_seconds']}s" if r.get("load_time_seconds") else ""
+        text_body += f"- {r['url']}: {flag} ({r['status']}){load}\n"
+        html_body += f"<li><strong>{r['url']}</strong> — {flag} ({r['status']}){load}</li>"
 
     html_body += "</ul>"
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
@@ -96,16 +151,24 @@ def send_email_report(results: List[Dict[str, Any]]) -> None:
 
 
 if __name__ == "__main__":
-    logging.info("Iniciando auditoria...")
+    banner("WEBSITE AUDIT BOT  -  EDITORA FUNDAMENTO", Fore.MAGENTA)
+    logging.info(f"{Fore.CYAN}Iniciando auditoria com Selenium...")
+
     audit_results = run_audit()
 
-    print("\nResultados:")
-    for r in audit_results:
-        flag = "OK  " if str(r.get("status")) == "200" else "ERRO"
-        print(f"  [{flag}] {r['url']} — {r['status']}")
-
+    banner("RESULTADOS DA AUDITORIA", Fore.BLUE)
     total = len(audit_results)
-    ok = sum(1 for r in audit_results if str(r.get("status")) == "200")
-    print(f"\n  {ok}/{total} checks passaram\n")
+    ok_count = 0
+    for r in audit_results:
+        is_ok = str(r.get("status")) == "200"
+        if is_ok:
+            ok_count += 1
+        flag = f"{Fore.GREEN}{Style.BRIGHT}  OK  " if is_ok else f"{Fore.RED}{Style.BRIGHT} ERRO "
+        load = f"{Fore.YELLOW}{r['load_time_seconds']}s" if r.get("load_time_seconds") else ""
+        print(f"  {flag}{Style.RESET_ALL} {Style.DIM}[{r['status']}]{Style.RESET_ALL} {r['url']} {load}")
+
+    summary_color = Fore.GREEN if ok_count == total else Fore.YELLOW
+    print(f"\n  {summary_color}{Style.BRIGHT}-> {ok_count}/{total} checks passaram{Style.RESET_ALL}\n")
 
     send_email_report(audit_results)
+    banner("AUDITORIA FINALIZADA", Fore.GREEN)
