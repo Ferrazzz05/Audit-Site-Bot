@@ -7,6 +7,7 @@ from typing import List, Dict, Any
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from selenium import webdriver
+from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from colorama import Fore, Style, init as colorama_init
 
@@ -57,6 +58,17 @@ PAGES_TO_CHECK = [
     "/pages/superpoderes-matematica",
 ]
 
+# Páginas de Monte seu Box — precisam de fluxo completo (12 livros + Comprar)
+BYOB_PAGES = {
+    "/products/monte-seu-box?page=addProductsPage1&currentFlow=byob",
+    "/products/monte-seu-box-adulto?page=addProductsPage1&currentFlow=byob",
+}
+
+# Páginas vitrine — apenas auditadas (status + tempo de carga), sem interação
+SHOWCASE_PAGES = {
+    "/pages/monte-seu-box-pronto",
+}
+
 
 def check_page(driver: webdriver.Chrome, url: str) -> Dict[str, Any]:
     logging.info(f"{Fore.CYAN}Auditando: {Style.BRIGHT}{url}")
@@ -80,9 +92,55 @@ def check_page(driver: webdriver.Chrome, url: str) -> Dict[str, Any]:
         return {"url": url, "status": status_code, "load_time_seconds": 0}
 
     load_time = round(time.time() - start_time, 2)
-    time.sleep(3)
+    time.sleep(5)
 
     return {"url": url, "status": status_code, "load_time_seconds": load_time}
+
+
+def add_books_and_buy(driver: webdriver.Chrome, quantity: int = 12) -> Dict[str, bool]:
+    """Fluxo BYOB: clica em N botões Adicionar e depois em Comprar."""
+    time.sleep(2)
+    added = 0
+
+    # Seletores CSS descobertos via DevTools — os botões são <div>, não <button>,
+    # e o texto "Adicionar" vem de um ::after CSS, por isso XPath por texto falha
+    buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbProductAddButton")
+    logging.info(f"{Fore.CYAN}  Encontrei {len(buttons)} botões Adicionar")
+
+    for btn in buttons:
+        if added >= quantity:
+            break
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center', behavior: 'instant'});",
+                btn,
+            )
+            time.sleep(0.25)
+            driver.execute_script("arguments[0].click();", btn)
+            time.sleep(0.4)
+            added += 1
+            logging.info(f"{Fore.GREEN}  Livro adicionado ({added}/{quantity})")
+        except Exception as e:
+            logging.debug(f"Falha ao clicar: {e}")
+
+    if added < quantity:
+        logging.warning(f"{Fore.YELLOW}Só consegui adicionar {added}/{quantity} livros")
+        return {"cart_ok": False, "checkout_ok": False}
+
+    # Clica em Comprar
+    try:
+        comprar_buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbFooterNextButton")
+        if not comprar_buttons:
+            logging.error(f"{Fore.RED}Botão Comprar não encontrado")
+            return {"cart_ok": True, "checkout_ok": False}
+
+        driver.execute_script("arguments[0].click();", comprar_buttons[0])
+        logging.info(f"{Fore.GREEN}Botão Comprar clicado")
+        time.sleep(3)
+        return {"cart_ok": True, "checkout_ok": True}
+    except Exception as e:
+        logging.error(f"{Fore.RED}Falhou ao clicar em Comprar: {e}")
+        return {"cart_ok": True, "checkout_ok": False}
 
 
 def run_audit() -> List[Dict[str, Any]]:
@@ -101,7 +159,35 @@ def run_audit() -> List[Dict[str, Any]]:
 
         for path in PAGES_TO_CHECK:
             full_url = TARGET_URL.rstrip("/") + "/" + path.lstrip("/")
+
+            if path in SHOWCASE_PAGES:
+                logging.info(f"{Fore.MAGENTA}Página vitrine: {Style.BRIGHT}{path}")
+
             results.append(check_page(driver, full_url))
+
+            if path in SHOWCASE_PAGES:
+                continue
+
+            try:
+                if path in BYOB_PAGES:
+                    logging.info(f"{Fore.CYAN}Iniciando fluxo BYOB: {Style.BRIGHT}{path}")
+                    result = add_books_and_buy(driver, quantity=12)
+                    results.append({
+                        "url": f"Fluxo BYOB 12 livros + Comprar ({path})",
+                        "status": "FUNCIONOU" if result["cart_ok"] else "FALHOU",
+                    })
+                else:
+                    buttons = driver.find_elements(
+                        By.XPATH,
+                        "//button[contains(., 'Adicionar') or contains(., 'Comprar') or contains(., 'Aproveite')]",
+                    )
+                    if buttons:
+                        driver.execute_script("arguments[0].click();", buttons[0])
+                        time.sleep(2)
+                        results.append({"url": f"Clique CTA ({path})", "status": "FUNCIONOU"})
+                        logging.info(f"{Fore.GREEN}Clique executado em: {Style.BRIGHT}{path}")
+            except Exception as e:
+                logging.warning(f"{Fore.YELLOW}Interação falhou em {path}: {e}")
     finally:
         driver.quit()
 
@@ -123,14 +209,14 @@ def send_email_report(results: List[Dict[str, Any]]) -> None:
     msg["To"] = receiver_email
 
     total = len(results)
-    ok = sum(1 for r in results if str(r.get("status")) == "200")
-    status_geral = "Tudo OK." if ok == total else f"Atenção: {total - ok} página(s) com erro."
+    ok = sum(1 for r in results if str(r.get("status")) in ["200", "FUNCIONOU"])
+    status_geral = "Tudo OK." if ok == total else f"Atenção: {total - ok} check(s) com erro."
 
     text_body = f"Auditoria Editora Fundamento\n\n{status_geral}\n\n"
     html_body = f"<h2>Auditoria Editora Fundamento</h2><p>{status_geral}</p><ul>"
 
     for r in results:
-        flag = "OK" if str(r.get("status")) == "200" else "ERRO"
+        flag = "OK" if str(r.get("status")) in ["200", "FUNCIONOU"] else "ERRO"
         load = f" | {r['load_time_seconds']}s" if r.get("load_time_seconds") else ""
         text_body += f"- {r['url']}: {flag} ({r['status']}){load}\n"
         html_body += f"<li><strong>{r['url']}</strong> — {flag} ({r['status']}){load}</li>"
@@ -160,7 +246,7 @@ if __name__ == "__main__":
     total = len(audit_results)
     ok_count = 0
     for r in audit_results:
-        is_ok = str(r.get("status")) == "200"
+        is_ok = str(r.get("status")) in ["200", "FUNCIONOU"]
         if is_ok:
             ok_count += 1
         flag = f"{Fore.GREEN}{Style.BRIGHT}  OK  " if is_ok else f"{Fore.RED}{Style.BRIGHT} ERRO "
