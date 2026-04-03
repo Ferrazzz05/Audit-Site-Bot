@@ -6,9 +6,8 @@ import requests
 from typing import List, Dict, Any
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from selenium import webdriver
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
 from colorama import Fore, Style, init as colorama_init
 
 try:
@@ -58,19 +57,29 @@ PAGES_TO_CHECK = [
     "/pages/superpoderes-matematica",
 ]
 
-# Páginas de Monte seu Box — precisam de fluxo completo (12 livros + Comprar)
 BYOB_PAGES = {
     "/products/monte-seu-box?page=addProductsPage1&currentFlow=byob",
     "/products/monte-seu-box-adulto?page=addProductsPage1&currentFlow=byob",
 }
 
-# Páginas vitrine — apenas auditadas (status + tempo de carga), sem interação
 SHOWCASE_PAGES = {
     "/pages/monte-seu-box-pronto",
 }
 
 
-def check_page(driver: webdriver.Chrome, url: str) -> Dict[str, Any]:
+def _close_drawer(driver: uc.Chrome) -> None:
+    """Fecha qualquer cart drawer aberto enviando Escape — evita que sobreponha os botões."""
+    try:
+        driver.execute_script(
+            "document.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key: 'Escape', keyCode: 27, which: 27, bubbles: true}));"
+        )
+        time.sleep(0.2)
+    except Exception:
+        pass
+
+
+def check_page(driver: uc.Chrome, url: str) -> Dict[str, Any]:
     logging.info(f"{Fore.CYAN}Auditando: {Style.BRIGHT}{url}")
 
     status_code = "Desconhecido"
@@ -97,13 +106,18 @@ def check_page(driver: webdriver.Chrome, url: str) -> Dict[str, Any]:
     return {"url": url, "status": status_code, "load_time_seconds": load_time}
 
 
-def add_books_and_buy(driver: webdriver.Chrome, quantity: int = 12) -> Dict[str, bool]:
-    """Fluxo BYOB: clica em N botões Adicionar e depois em Comprar."""
+def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
+    """
+    Fluxo BYOB: adiciona N livros e clica em Comprar.
+
+    Os botões são <div class="gbbProductAddButton"> — não são <button> e o texto
+    "Adicionar" vem de um ::after CSS, então qualquer XPath por texto falha.
+    Seletores CSS descobertos manualmente via DevTools.
+    """
+    _close_drawer(driver)
     time.sleep(2)
     added = 0
 
-    # Seletores CSS descobertos via DevTools — os botões são <div>, não <button>,
-    # e o texto "Adicionar" vem de um ::after CSS, por isso XPath por texto falha
     buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbProductAddButton")
     logging.info(f"{Fore.CYAN}  Encontrei {len(buttons)} botões Adicionar")
 
@@ -118,6 +132,7 @@ def add_books_and_buy(driver: webdriver.Chrome, quantity: int = 12) -> Dict[str,
             time.sleep(0.25)
             driver.execute_script("arguments[0].click();", btn)
             time.sleep(0.4)
+            _close_drawer(driver)
             added += 1
             logging.info(f"{Fore.GREEN}  Livro adicionado ({added}/{quantity})")
         except Exception as e:
@@ -127,14 +142,32 @@ def add_books_and_buy(driver: webdriver.Chrome, quantity: int = 12) -> Dict[str,
         logging.warning(f"{Fore.YELLOW}Só consegui adicionar {added}/{quantity} livros")
         return {"cart_ok": False, "checkout_ok": False}
 
-    # Clica em Comprar
+    # Comprar — dispara eventos de mouse reais para garantir que o handler React receba
+    # um evento "trusted" (element.click() às vezes é ignorado pelo Synthetic Events do React)
+    _close_drawer(driver)
     try:
         comprar_buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbFooterNextButton")
         if not comprar_buttons:
             logging.error(f"{Fore.RED}Botão Comprar não encontrado")
             return {"cart_ok": True, "checkout_ok": False}
 
-        driver.execute_script("arguments[0].click();", comprar_buttons[0])
+        target = comprar_buttons[0]
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
+        time.sleep(0.5)
+
+        driver.execute_script(
+            "const el = arguments[0];"
+            "const r = el.getBoundingClientRect();"
+            "const x = r.left + r.width / 2;"
+            "const y = r.top + r.height / 2;"
+            "['mousedown', 'mouseup', 'click'].forEach(t => {"
+            "  el.dispatchEvent(new MouseEvent(t, {"
+            "    bubbles: true, cancelable: true, view: window,"
+            "    clientX: x, clientY: y, button: 0"
+            "  }));"
+            "});",
+            target,
+        )
         logging.info(f"{Fore.GREEN}Botão Comprar clicado")
         time.sleep(3)
         return {"cart_ok": True, "checkout_ok": True}
@@ -146,11 +179,13 @@ def add_books_and_buy(driver: webdriver.Chrome, quantity: int = 12) -> Dict[str,
 def run_audit() -> List[Dict[str, Any]]:
     results = []
 
-    chrome_options = Options()
+    # undetected-chromedriver: patcha o ChromeDriver pra remover os flags que o
+    # Cloudflare Turnstile usa pra detectar automação (navigator.webdriver, etc.)
+    chrome_options = uc.ChromeOptions()
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
 
-    driver = webdriver.Chrome(options=chrome_options)
+    driver = uc.Chrome(options=chrome_options, version_main=146)
     driver.set_window_rect(x=0, y=0, width=960, height=1040)
 
     try:
