@@ -68,7 +68,7 @@ SHOWCASE_PAGES = {
 
 
 def _close_drawer(driver: uc.Chrome) -> None:
-    """Fecha qualquer cart drawer aberto enviando Escape — evita que sobreponha os botões."""
+    """Fecha qualquer cart drawer aberto — necessário após cada clique pra não bloquear os próximos."""
     try:
         driver.execute_script(
             "document.dispatchEvent(new KeyboardEvent('keydown', "
@@ -77,6 +77,26 @@ def _close_drawer(driver: uc.Chrome) -> None:
         time.sleep(0.2)
     except Exception:
         pass
+
+
+def _read_cart_count(driver: uc.Chrome) -> int:
+    """
+    Lê o contador 'N item(s)' do sidebar do BYOB via JavaScript.
+
+    Usar o contador como fonte de verdade em vez de contar cliques evita
+    falsos positivos — só conta como adicionado se o React realmente atualizou o estado.
+    Retorna -1 se o elemento não for encontrado.
+    """
+    try:
+        return driver.execute_script(
+            "const el = [...document.querySelectorAll('*')]"
+            "  .find(e => /\\d+\\s*item/i.test(e.innerText || '') && e.children.length === 0);"
+            "if (!el) return -1;"
+            "const m = el.innerText.match(/(\\d+)\\s*item/i);"
+            "return m ? parseInt(m[1]) : -1;"
+        )
+    except Exception:
+        return -1
 
 
 def check_page(driver: uc.Chrome, url: str) -> Dict[str, Any]:
@@ -108,42 +128,90 @@ def check_page(driver: uc.Chrome, url: str) -> Dict[str, Any]:
 
 def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
     """
-    Fluxo BYOB: adiciona N livros e clica em Comprar.
+    Fluxo BYOB completo: adiciona N livros e clica em Comprar.
 
-    Os botões são <div class="gbbProductAddButton"> — não são <button> e o texto
-    "Adicionar" vem de um ::after CSS, então qualquer XPath por texto falha.
-    Seletores CSS descobertos manualmente via DevTools.
+    A lógica de adição usa o contador do carrinho como fonte de verdade em vez
+    de simplesmente contar cliques. Inclui fallback para a versão adulta, cujas
+    categorias têm menos de 12 títulos — nesse caso incrementa a quantidade de
+    livros já adicionados via .gbbProductQuantityAddButton.
     """
     _close_drawer(driver)
     time.sleep(2)
-    added = 0
 
-    buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbProductAddButton")
-    logging.info(f"{Fore.CYAN}  Encontrei {len(buttons)} botões Adicionar")
+    initial_count = _read_cart_count(driver)
+    logging.info(f"{Fore.CYAN}  Contador inicial do carrinho: {initial_count}")
 
-    for btn in buttons:
-        if added >= quantity:
-            break
+    target_count = (initial_count if initial_count >= 0 else 0) + quantity
+    max_attempts = quantity * 4
+    attempts = 0
+
+    def _try_click_and_check(element) -> bool:
+        """Scrolla até o elemento, clica e verifica se o contador aumentou."""
+        nonlocal attempts
+        attempts += 1
         try:
             driver.execute_script(
                 "arguments[0].scrollIntoView({block: 'center', behavior: 'instant'});",
-                btn,
+                element,
             )
             time.sleep(0.25)
-            driver.execute_script("arguments[0].click();", btn)
+            before = _read_cart_count(driver)
+            driver.execute_script("arguments[0].click();", element)
             time.sleep(0.4)
             _close_drawer(driver)
-            added += 1
-            logging.info(f"{Fore.GREEN}  Livro adicionado ({added}/{quantity})")
+            after = _read_cart_count(driver)
+            if after > before:
+                logging.info(f"{Fore.GREEN}  Livro adicionado ({after}/{target_count})")
+                return True
         except Exception as e:
             logging.debug(f"Falha ao clicar: {e}")
+        return False
+
+    while attempts < max_attempts:
+        current = _read_cart_count(driver)
+        if current >= 0 and current >= target_count:
+            logging.info(f"{Fore.GREEN}  Alvo atingido: {current} item(s)")
+            break
+
+        # Tenta os botões "Adicionar" disponíveis (livros ainda não no carrinho)
+        buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbProductAddButton")
+        progressed = False
+        for btn in buttons:
+            if attempts >= max_attempts:
+                break
+            if _try_click_and_check(btn):
+                progressed = True
+                if _read_cart_count(driver) >= target_count:
+                    break
+
+        if _read_cart_count(driver) >= target_count:
+            break
+
+        # Fallback: sem mais botões Adicionar disponíveis — incrementa quantidade
+        # dos livros já no carrinho usando o "+" (gbbProductQuantityAddButton)
+        if not progressed:
+            plus_buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbProductQuantityAddButton")
+            logging.info(f"{Fore.CYAN}  Fallback: {len(plus_buttons)} botões '+' de quantidade")
+            for plus in plus_buttons:
+                if attempts >= max_attempts:
+                    break
+                if _try_click_and_check(plus):
+                    progressed = True
+                    if _read_cart_count(driver) >= target_count:
+                        break
+
+        if not progressed:
+            logging.warning(f"{Fore.YELLOW}Sem progresso — abandonando")
+            break
+
+    final_count = _read_cart_count(driver)
+    added = max(0, (final_count if final_count >= 0 else 0) - (initial_count if initial_count >= 0 else 0))
 
     if added < quantity:
         logging.warning(f"{Fore.YELLOW}Só consegui adicionar {added}/{quantity} livros")
         return {"cart_ok": False, "checkout_ok": False}
 
-    # Comprar — dispara eventos de mouse reais para garantir que o handler React receba
-    # um evento "trusted" (element.click() às vezes é ignorado pelo Synthetic Events do React)
+    # Clica em Comprar disparando eventos de mouse reais para acionar o handler React
     _close_drawer(driver)
     try:
         comprar_buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbFooterNextButton")
@@ -168,7 +236,7 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
             "});",
             target,
         )
-        logging.info(f"{Fore.GREEN}Botão Comprar clicado")
+        logging.info(f"{Fore.GREEN}Botão Comprar clicado com sucesso")
         time.sleep(3)
         return {"cart_ok": True, "checkout_ok": True}
     except Exception as e:
@@ -179,8 +247,8 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
 def run_audit() -> List[Dict[str, Any]]:
     results = []
 
-    # undetected-chromedriver: patcha o ChromeDriver pra remover os flags que o
-    # Cloudflare Turnstile usa pra detectar automação (navigator.webdriver, etc.)
+    # undetected-chromedriver patcha o ChromeDriver pra remover os indicadores que
+    # o Cloudflare Turnstile usa pra bloquear automação (navigator.webdriver, etc.)
     chrome_options = uc.ChromeOptions()
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
