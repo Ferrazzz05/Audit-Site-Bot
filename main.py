@@ -47,7 +47,10 @@ def banner(text: str, color: str = Fore.CYAN) -> None:
     print(f"{line}{Style.RESET_ALL}\n")
 
 
+# URL base do site monitorado
 TARGET_URL = "https://editorafundamento.com.br/"
+
+# Todas as páginas que entram na auditoria — ordem importa pra navegação sequencial
 PAGES_TO_CHECK = [
     "/pages/monte-seu-box-pronto",
     "/products/monte-seu-box?page=addProductsPage1&currentFlow=byob",
@@ -57,18 +60,20 @@ PAGES_TO_CHECK = [
     "/pages/superpoderes-matematica",
 ]
 
+# Páginas que exigem o fluxo completo: adicionar 12 livros + clicar Comprar + validar checkout
 BYOB_PAGES = {
     "/products/monte-seu-box?page=addProductsPage1&currentFlow=byob",
     "/products/monte-seu-box-adulto?page=addProductsPage1&currentFlow=byob",
 }
 
+# Páginas vitrine: auditadas apenas por status e tempo de carga, sem interação
 SHOWCASE_PAGES = {
     "/pages/monte-seu-box-pronto",
 }
 
 
 def _close_drawer(driver: uc.Chrome) -> None:
-    """Fecha qualquer cart drawer aberto — necessário após cada clique pra não bloquear os próximos."""
+    """Fecha qualquer cart drawer aberto via Escape — evita que sobreponha os botões nos passos seguintes."""
     try:
         driver.execute_script(
             "document.dispatchEvent(new KeyboardEvent('keydown', "
@@ -81,11 +86,11 @@ def _close_drawer(driver: uc.Chrome) -> None:
 
 def _read_cart_count(driver: uc.Chrome) -> int:
     """
-    Lê o contador 'N item(s)' do sidebar do BYOB via JavaScript.
+    Lê o contador 'N item(s)' do sidebar BYOB diretamente no DOM via JavaScript.
 
-    Usar o contador como fonte de verdade em vez de contar cliques evita
-    falsos positivos — só conta como adicionado se o React realmente atualizou o estado.
-    Retorna -1 se o elemento não for encontrado.
+    Usar o contador como fonte de verdade em vez de contar cliques elimina falsos
+    positivos — só registra livro adicionado quando o React realmente atualizou o estado.
+    Retorna -1 se o elemento não for encontrado na página.
     """
     try:
         return driver.execute_script(
@@ -99,41 +104,72 @@ def _read_cart_count(driver: uc.Chrome) -> int:
         return -1
 
 
+def _verify_checkout_reached(driver: uc.Chrome, previous_url: str, timeout: float = 20.0) -> bool:
+    """
+    Valida que o clique em Comprar realmente navegou para o checkout.
+
+    Considera sucesso se a URL mudou em relação à página anterior — qualquer mudança
+    indica que o clique teve efeito. Timeout de 20s porque o Shopify leva ~11s pra
+    redirecionar dependendo da carga do servidor.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        url = driver.current_url or ""
+        if url != previous_url:
+            return True
+        if any(k in url.lower() for k in ("/checkout", "/cart", "checkout.shopify")):
+            return True
+        time.sleep(0.3)
+    return False
+
+
 def check_page(driver: uc.Chrome, url: str) -> Dict[str, Any]:
-    logging.info(f"{Fore.CYAN}Auditando: {Style.BRIGHT}{url}")
+    """
+    Audita uma página verificando status HTTP via requests e tempo de carga real via Selenium.
+
+    Usa dois métodos complementares: requests é rápido e retorna o status code HTTP,
+    Selenium mede o tempo de renderização no browser como um usuário real veria.
+    """
+    logging.info(f"{Fore.CYAN}Auditando página: {Style.BRIGHT}{url}")
 
     status_code = "Desconhecido"
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         req = requests.get(url, headers=headers, timeout=10)
         status_code = req.status_code
     except requests.RequestException as e:
-        status_code = f"Erro: {e}"
-        logging.error(f"HTTP falhou em {url}: {e}")
+        status_code = f"Erro de Conexão: {e}"
+        logging.error(f"Failed to fetch {url} via HTTP: {e}")
 
     start_time = time.time()
     try:
         driver.get(url)
     except Exception as e:
-        logging.error(f"Selenium falhou em {url}: {e}")
+        logging.error(f"Failed to load page with Selenium: {url} - {e}")
         return {"url": url, "status": status_code, "load_time_seconds": 0}
 
-    load_time = round(time.time() - start_time, 2)
+    load_time = time.time() - start_time
+
+    # Aguarda hidratação do React antes de procurar botões
     time.sleep(5)
 
-    return {"url": url, "status": status_code, "load_time_seconds": load_time}
+    return {"url": url, "status": status_code, "load_time_seconds": round(load_time, 2)}
 
 
 def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
     """
-    Fluxo BYOB completo: adiciona N livros e clica em Comprar.
+    Fluxo BYOB completo: adiciona N livros ao carrinho e clica em Comprar.
 
-    A lógica de adição usa o contador do carrinho como fonte de verdade em vez
-    de simplesmente contar cliques. Inclui fallback para a versão adulta, cujas
-    categorias têm menos de 12 títulos — nesse caso incrementa a quantidade de
-    livros já adicionados via .gbbProductQuantityAddButton.
+    Decisões de implementação relevantes:
+    - Os botões são <div class="gbbProductAddButton">, não <button>. O texto "Adicionar"
+      vem de um ::after CSS, então XPath por texto visível falha completamente.
+    - O clique em Comprar usa dispatchEvent com MouseEvent real (mousedown + mouseup + click)
+      porque o element.click() do Selenium nem sempre aciona Synthetic Events do React.
+    - Fallback para .gbbProductQuantityAddButton quando a categoria não tem 12 títulos
+      (acontece na versão adulta) — incrementa a quantidade de um livro já adicionado.
     """
     _close_drawer(driver)
     time.sleep(2)
@@ -146,7 +182,7 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
     attempts = 0
 
     def _try_click_and_check(element) -> bool:
-        """Scrolla até o elemento, clica e verifica se o contador aumentou."""
+        """Scrolla até o elemento, clica e confirma se o contador do carrinho aumentou."""
         nonlocal attempts
         attempts += 1
         try:
@@ -173,7 +209,7 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
             logging.info(f"{Fore.GREEN}  Alvo atingido: {current} item(s)")
             break
 
-        # Tenta os botões "Adicionar" disponíveis (livros ainda não no carrinho)
+        # 1ª tentativa: clica nos botões Adicionar de livros ainda não no carrinho
         buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbProductAddButton")
         progressed = False
         for btn in buttons:
@@ -187,8 +223,8 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
         if _read_cart_count(driver) >= target_count:
             break
 
-        # Fallback: sem mais botões Adicionar disponíveis — incrementa quantidade
-        # dos livros já no carrinho usando o "+" (gbbProductQuantityAddButton)
+        # 2ª tentativa (fallback): quando não há mais botões Adicionar disponíveis,
+        # incrementa a quantidade de livros já no carrinho via botão "+"
         if not progressed:
             plus_buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbProductQuantityAddButton")
             logging.info(f"{Fore.CYAN}  Fallback: {len(plus_buttons)} botões '+' de quantidade")
@@ -211,17 +247,20 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
         logging.warning(f"{Fore.YELLOW}Só consegui adicionar {added}/{quantity} livros")
         return {"cart_ok": False, "checkout_ok": False}
 
-    # Clica em Comprar disparando eventos de mouse reais para acionar o handler React
+    # Clica em Comprar usando eventos de mouse reais para garantir que o React processe
     _close_drawer(driver)
     try:
         comprar_buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbFooterNextButton")
-        if not comprar_buttons:
-            logging.error(f"{Fore.RED}Botão Comprar não encontrado")
+        target = comprar_buttons[0] if comprar_buttons else None
+
+        if target is None:
+            logging.error(f"{Fore.RED}Botão 'Comprar' não encontrado")
             return {"cart_ok": True, "checkout_ok": False}
 
-        target = comprar_buttons[0]
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
         time.sleep(0.5)
+
+        url_before_click = driver.current_url
 
         driver.execute_script(
             "const el = arguments[0];"
@@ -236,24 +275,37 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
             "});",
             target,
         )
-        logging.info(f"{Fore.GREEN}Botão Comprar clicado com sucesso")
-        time.sleep(3)
-        return {"cart_ok": True, "checkout_ok": True}
+        logging.info(f"{Fore.GREEN}Botão 'Comprar' clicado com sucesso")
+
+        if _verify_checkout_reached(driver, url_before_click, timeout=20.0):
+            logging.info(f"{Fore.GREEN}Checkout alcançado: {driver.current_url}")
+            return {"cart_ok": True, "checkout_ok": True}
+        else:
+            logging.warning(
+                f"{Fore.YELLOW}Clique em 'Comprar' não levou ao checkout "
+                f"(URL atual: {driver.current_url})"
+            )
+            return {"cart_ok": True, "checkout_ok": False}
     except Exception as e:
-        logging.error(f"{Fore.RED}Falhou ao clicar em Comprar: {e}")
+        logging.error(f"{Fore.RED}Falhou ao clicar em 'Comprar': {e}")
         return {"cart_ok": True, "checkout_ok": False}
 
 
 def run_audit() -> List[Dict[str, Any]]:
+    """
+    Orquestra a auditoria completa: visita todas as páginas, roda o fluxo BYOB
+    nas páginas de conversão e retorna a lista de resultados consolidada.
+    """
     results = []
 
-    # undetected-chromedriver patcha o ChromeDriver pra remover os indicadores que
+    # undetected-chromedriver patcha o ChromeDriver removendo os indicadores que
     # o Cloudflare Turnstile usa pra bloquear automação (navigator.webdriver, etc.)
     chrome_options = uc.ChromeOptions()
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
 
     driver = uc.Chrome(options=chrome_options, version_main=146)
+    # Metade esquerda da tela em FullHD — deixa o terminal visível na metade direita
     driver.set_window_rect(x=0, y=0, width=960, height=1040)
 
     try:
@@ -266,31 +318,41 @@ def run_audit() -> List[Dict[str, Any]]:
             if path in SHOWCASE_PAGES:
                 logging.info(f"{Fore.MAGENTA}Página vitrine: {Style.BRIGHT}{path}")
 
-            results.append(check_page(driver, full_url))
+            res = check_page(driver, full_url)
+            results.append(res)
 
             if path in SHOWCASE_PAGES:
+                # Página vitrine: apenas auditoria de status e tempo, sem interação
                 continue
 
             try:
                 if path in BYOB_PAGES:
-                    logging.info(f"{Fore.CYAN}Iniciando fluxo BYOB: {Style.BRIGHT}{path}")
+                    logging.info(f"{Fore.CYAN}Iniciando fluxo BYOB em: {Style.BRIGHT}{path}")
                     result = add_books_and_buy(driver, quantity=12)
                     results.append({
                         "url": f"Fluxo BYOB 12 livros + Comprar ({path})",
                         "status": "FUNCIONOU" if result["cart_ok"] else "FALHOU",
                     })
+                    results.append({
+                        "url": f"Checkout alcançado ({path})",
+                        "status": "FUNCIONOU" if result["checkout_ok"] else "FALHOU",
+                    })
                 else:
+                    # Páginas de conversão simples: clica no primeiro CTA disponível
                     buttons = driver.find_elements(
                         By.XPATH,
-                        "//button[contains(., 'Adicionar') or contains(., 'Comprar') or contains(., 'Aproveite')]",
+                        "//button[contains(., 'Adicionar') or contains(., 'Comprar') "
+                        "or contains(., 'Compre') or contains(., 'Aproveite') or contains(., 'Avançar')]",
                     )
                     if buttons:
                         driver.execute_script("arguments[0].click();", buttons[0])
                         time.sleep(2)
-                        results.append({"url": f"Clique CTA ({path})", "status": "FUNCIONOU"})
-                        logging.info(f"{Fore.GREEN}Clique executado em: {Style.BRIGHT}{path}")
+                        results.append({"url": f"Clique 'Comprar' ({path})", "status": "FUNCIONOU"})
+                        logging.info(f"{Fore.GREEN}Clique executado com sucesso em: {Style.BRIGHT}{path}")
+                    else:
+                        logging.debug(f"Nenhum botão de compra encontrado em: {path}")
             except Exception as e:
-                logging.warning(f"{Fore.YELLOW}Interação falhou em {path}: {e}")
+                logging.warning(f"{Fore.YELLOW}Não foi possível interagir com {path}: {e}")
     finally:
         driver.quit()
 
@@ -298,12 +360,16 @@ def run_audit() -> List[Dict[str, Any]]:
 
 
 def send_email_report(results: List[Dict[str, Any]]) -> None:
+    """
+    Gera e envia o relatório consolidado por email via SMTP.
+    As credenciais são lidas de variáveis de ambiente para não ficarem no código.
+    """
     sender_email = os.environ.get("SMTP_USER", "")
     sender_password = os.environ.get("SMTP_PASS", "")
     receiver_email = os.environ.get("TO_EMAIL", "")
 
     if not sender_email or not sender_password or not receiver_email:
-        logging.warning("Credenciais SMTP não configuradas — email não enviado.")
+        logging.warning("Skipping email... SMTP credentials or TO_EMAIL not set in environment.")
         return
 
     msg = MIMEMultipart("alternative")
@@ -311,32 +377,53 @@ def send_email_report(results: List[Dict[str, Any]]) -> None:
     msg["From"] = sender_email
     msg["To"] = receiver_email
 
-    total = len(results)
-    ok = sum(1 for r in results if str(r.get("status")) in ["200", "FUNCIONOU"])
-    status_geral = "Tudo OK." if ok == total else f"Atenção: {total - ok} check(s) com erro."
+    total_pages = len(results)
+    pages_ok = sum(1 for r in results if str(r.get("status")) in ["200", "FUNCIONOU"])
 
-    text_body = f"Auditoria Editora Fundamento\n\n{status_geral}\n\n"
-    html_body = f"<h2>Auditoria Editora Fundamento</h2><p>{status_geral}</p><ul>"
+    status_geral = (
+        "Tudo funcionando perfeitamente (Páginas e Carrinho)."
+        if pages_ok == total_pages
+        else "Atenção: Alguma página ou teste falhou."
+    )
+
+    html_body = f"""
+    <h2>Auditoria Editora Fundamento</h2>
+    <p><strong>Status Geral:</strong> {status_geral}</p>
+    <hr>
+    <ul>
+    """
+    text_body = f"Relatório de Auditoria: Editora Fundamento\n\nStatus Geral: {status_geral}\n\nResumo:\n"
 
     for r in results:
-        flag = "OK" if str(r.get("status")) in ["200", "FUNCIONOU"] else "ERRO"
-        load = f" | {r['load_time_seconds']}s" if r.get("load_time_seconds") else ""
-        text_body += f"- {r['url']}: {flag} ({r['status']}){load}\n"
-        html_body += f"<li><strong>{r['url']}</strong> — {flag} ({r['status']}){load}</li>"
+        status_val = str(r.get("status"))
+        is_ok = status_val in ["200", "FUNCIONOU"]
+        status_flag = "OK" if is_ok else "ERRO"
+        load_time_txt = (
+            f" | {r['load_time_seconds']}s"
+            if "load_time_seconds" in r and r["load_time_seconds"] > 0
+            else ""
+        )
+        text_body += f"- {r['url']}: {status_flag} ({status_val}){load_time_txt}\n"
+        html_body += (
+            f"<li><strong>{r['url']}</strong> — {status_flag} ({status_val}){load_time_txt}</li>"
+        )
 
     html_body += "</ul>"
+
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
+        logging.info("Connecting to SMTP server...")
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
         server.login(sender_email, sender_password)
-        server.sendmail(sender_email, receiver_email.split(","), msg.as_string())
+        to_addrs = [email.strip() for email in receiver_email.split(",") if email.strip()]
+        server.sendmail(sender_email, to_addrs, msg.as_string())
         server.quit()
-        logging.info("Relatório enviado por email.")
+        logging.info("Email report sent successfully!")
     except Exception as e:
-        logging.error(f"Falha ao enviar email: {e}")
+        logging.error(f"Failed to send email: {e}")
 
 
 if __name__ == "__main__":
@@ -349,15 +436,18 @@ if __name__ == "__main__":
     total = len(audit_results)
     ok_count = 0
     for r in audit_results:
-        is_ok = str(r.get("status")) in ["200", "FUNCIONOU"]
+        status_code = r.get("status")
+        is_ok = str(status_code) in ["200", "FUNCIONOU"]
         if is_ok:
             ok_count += 1
         flag = f"{Fore.GREEN}{Style.BRIGHT}  OK  " if is_ok else f"{Fore.RED}{Style.BRIGHT} ERRO "
-        load = f"{Fore.YELLOW}{r['load_time_seconds']}s" if r.get("load_time_seconds") else ""
-        print(f"  {flag}{Style.RESET_ALL} {Style.DIM}[{r['status']}]{Style.RESET_ALL} {r['url']} {load}")
+        load_time = r.get("load_time_seconds", "N/A")
+        time_txt = f"{Fore.YELLOW}{load_time}s" if load_time and load_time != "N/A" else ""
+        print(f"  {flag}{Style.RESET_ALL} {Style.DIM}[{status_code}]{Style.RESET_ALL} {r['url']} {time_txt}")
 
     summary_color = Fore.GREEN if ok_count == total else Fore.YELLOW
     print(f"\n  {summary_color}{Style.BRIGHT}-> {ok_count}/{total} checks passaram{Style.RESET_ALL}\n")
 
+    logging.info(f"{Fore.CYAN}Gerando e enviando relatório por email...")
     send_email_report(audit_results)
     banner("AUDITORIA FINALIZADA", Fore.GREEN)
