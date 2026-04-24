@@ -53,7 +53,7 @@ TARGET_URL = "https://editorafundamento.com.br/"
 # Todas as páginas que entram na auditoria — ordem importa pra navegação sequencial
 PAGES_TO_CHECK = [
     "/pages/monte-seu-box-pronto",
-    "/products/monte-seu-box?page=addProductsPage1&currentFlow=byob",
+    "/pages/box-personalizado-novo",
     "/collections/box-pronto",
     "/products/monte-seu-box-adulto?page=addProductsPage1&currentFlow=byob",
     "/pages/mundo-alfabeto",
@@ -61,9 +61,15 @@ PAGES_TO_CHECK = [
 ]
 
 # Páginas que exigem o fluxo completo: adicionar 12 livros + clicar Comprar + validar checkout
+# Cada página tem o seletor CSS do botão "Adicionar" descoberto via DevTools
 BYOB_PAGES = {
-    "/products/monte-seu-box?page=addProductsPage1&currentFlow=byob",
+    "/pages/box-personalizado-novo",
     "/products/monte-seu-box-adulto?page=addProductsPage1&currentFlow=byob",
+}
+
+BYOB_SELECTORS = {
+    "/pages/box-personalizado-novo": "button[class*='variantSelector_container']",
+    "/products/monte-seu-box-adulto?page=addProductsPage1&currentFlow=byob": ".gbbProductAddButton",
 }
 
 # Páginas vitrine: auditadas apenas por status e tempo de carga, sem interação
@@ -104,23 +110,51 @@ def _read_cart_count(driver: uc.Chrome) -> int:
         return -1
 
 
-def _verify_checkout_reached(driver: uc.Chrome, previous_url: str, timeout: float = 20.0) -> bool:
+def _verify_checkout_reached(driver: uc.Chrome, timeout: float = 20.0) -> bool:
     """
     Valida que o clique em Comprar realmente navegou para o checkout.
 
-    Considera sucesso se a URL mudou em relação à página anterior — qualquer mudança
-    indica que o clique teve efeito. Timeout de 20s porque o Shopify leva ~11s pra
-    redirecionar dependendo da carga do servidor.
+    Só aceita URLs com /checkout ou checkout.shopify — evita falsos positivos
+    quando o clique redireciona para outra página (ex: página inicial).
+    Timeout de 20s porque o Shopify leva ~11s pra redirecionar dependendo da carga.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
         url = driver.current_url or ""
-        if url != previous_url:
-            return True
-        if any(k in url.lower() for k in ("/checkout", "/cart", "checkout.shopify")):
+        if any(k in url.lower() for k in ("/checkout", "checkout.shopify")):
             return True
         time.sleep(0.3)
     return False
+
+
+def _cart_to_checkout(driver: uc.Chrome, timeout: float = 15.0) -> bool:
+    """
+    Após um clique de compra, aguarda o caminho para o checkout.
+    Suporta dois fluxos:
+    - Navegação para /cart (redireciona a página inteira)
+    - Drawer de carrinho (a URL não muda, mas o botão de checkout aparece no DOM)
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if "/cart" in (driver.current_url or "").lower():
+            break
+        if driver.find_elements(By.CSS_SELECTOR, "[name='checkout']"):
+            break
+        time.sleep(0.3)
+    else:
+        return False
+
+    checkout_btn = driver.find_elements(By.CSS_SELECTOR, "[name='checkout']")
+    if not checkout_btn:
+        checkout_btn = driver.find_elements(
+            By.XPATH,
+            "//button[contains(., 'Finalizar') or contains(., 'Confira') or contains(., 'Checkout')]",
+        )
+    if not checkout_btn:
+        return False
+
+    driver.execute_script("arguments[0].click();", checkout_btn[0])
+    return _verify_checkout_reached(driver, timeout=20.0)
 
 
 def check_page(driver: uc.Chrome, url: str) -> Dict[str, Any]:
@@ -159,13 +193,14 @@ def check_page(driver: uc.Chrome, url: str) -> Dict[str, Any]:
     return {"url": url, "status": status_code, "load_time_seconds": round(load_time, 2)}
 
 
-def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
+def add_books_and_buy(driver: uc.Chrome, quantity: int = 12, add_selector: str = ".gbbProductAddButton") -> Dict[str, bool]:
     """
     Fluxo BYOB completo: adiciona N livros ao carrinho e clica em Comprar.
 
     Decisões de implementação relevantes:
-    - Os botões são <div class="gbbProductAddButton">, não <button>. O texto "Adicionar"
-      vem de um ::after CSS, então XPath por texto visível falha completamente.
+    - Os botões do fluxo adulto são <div class="gbbProductAddButton">, não <button>.
+      O texto "Adicionar" vem de um ::after CSS, então XPath por texto visível falha.
+    - Para a nova página infantil, o contador DOM retorna -1; nesse caso conta os cliques.
     - O clique em Comprar usa dispatchEvent com MouseEvent real (mousedown + mouseup + click)
       porque o element.click() do Selenium nem sempre aciona Synthetic Events do React.
     - Fallback para .gbbProductQuantityAddButton quando a categoria não tem 12 títulos
@@ -178,13 +213,12 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
     logging.info(f"{Fore.CYAN}  Contador inicial do carrinho: {initial_count}")
 
     target_count = (initial_count if initial_count >= 0 else 0) + quantity
-    max_attempts = quantity * 4
-    attempts = 0
+    added = 0  # contador de cliques — usado quando _read_cart_count não está disponível
 
     def _try_click_and_check(element) -> bool:
-        """Scrolla até o elemento, clica e confirma se o contador do carrinho aumentou."""
-        nonlocal attempts
-        attempts += 1
+        """Scrolla até o elemento, clica e confirma se o livro foi adicionado.
+        Usa o contador do DOM quando disponível; caso contrário confia no clique."""
+        nonlocal added
         try:
             driver.execute_script(
                 "arguments[0].scrollIntoView({block: 'center', behavior: 'instant'});",
@@ -197,30 +231,36 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
             _close_drawer(driver)
             after = _read_cart_count(driver)
             if after > before:
-                logging.info(f"{Fore.GREEN}  Livro adicionado ({after}/{target_count})")
+                added += 1
+                logging.info(f"{Fore.GREEN}  Livro adicionado ({added}/{quantity})")
+                return True
+            if before == -1:
+                # Contador indisponível nessa página — trata o clique como bem-sucedido
+                added += 1
+                logging.info(f"{Fore.GREEN}  Livro adicionado ({added}/{quantity})")
                 return True
         except Exception as e:
             logging.debug(f"Falha ao clicar: {e}")
         return False
 
-    while attempts < max_attempts:
+    while added < quantity:
         current = _read_cart_count(driver)
         if current >= 0 and current >= target_count:
             logging.info(f"{Fore.GREEN}  Alvo atingido: {current} item(s)")
             break
 
         # 1ª tentativa: clica nos botões Adicionar de livros ainda não no carrinho
-        buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbProductAddButton")
+        buttons = driver.find_elements(By.CSS_SELECTOR, add_selector)
         progressed = False
         for btn in buttons:
-            if attempts >= max_attempts:
+            if added >= quantity:
                 break
             if _try_click_and_check(btn):
                 progressed = True
-                if _read_cart_count(driver) >= target_count:
+                if added >= quantity or _read_cart_count(driver) >= target_count:
                     break
 
-        if _read_cart_count(driver) >= target_count:
+        if added >= quantity or _read_cart_count(driver) >= target_count:
             break
 
         # 2ª tentativa (fallback): quando não há mais botões Adicionar disponíveis,
@@ -229,7 +269,7 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
             plus_buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbProductQuantityAddButton")
             logging.info(f"{Fore.CYAN}  Fallback: {len(plus_buttons)} botões '+' de quantidade")
             for plus in plus_buttons:
-                if attempts >= max_attempts:
+                if added >= quantity:
                     break
                 if _try_click_and_check(plus):
                     progressed = True
@@ -240,8 +280,11 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
             logging.warning(f"{Fore.YELLOW}Sem progresso — abandonando")
             break
 
+    # Usa o contador DOM como fonte de verdade quando disponível;
+    # senão mantém o added acumulado pelo loop (fallback para páginas sem contador)
     final_count = _read_cart_count(driver)
-    added = max(0, (final_count if final_count >= 0 else 0) - (initial_count if initial_count >= 0 else 0))
+    if final_count >= 0:
+        added = max(0, final_count - (initial_count if initial_count >= 0 else 0))
 
     if added < quantity:
         logging.warning(f"{Fore.YELLOW}Só consegui adicionar {added}/{quantity} livros")
@@ -250,7 +293,15 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
     # Clica em Comprar usando eventos de mouse reais para garantir que o React processe
     _close_drawer(driver)
     try:
+        # Tenta os seletores conhecidos de cada fluxo antes de recorrer ao XPath por texto
         comprar_buttons = driver.find_elements(By.CSS_SELECTOR, ".gbbFooterNextButton")
+        if not comprar_buttons:
+            comprar_buttons = driver.find_elements(By.CSS_SELECTOR, ".rbr-addBundleBtn-container")
+        if not comprar_buttons:
+            comprar_buttons = driver.find_elements(
+                By.XPATH,
+                "//button[contains(., 'Comprar') or contains(., 'Finalizar')]",
+            )
         target = comprar_buttons[0] if comprar_buttons else None
 
         if target is None:
@@ -259,8 +310,6 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
 
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
         time.sleep(0.5)
-
-        url_before_click = driver.current_url
 
         driver.execute_script(
             "const el = arguments[0];"
@@ -277,7 +326,7 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12) -> Dict[str, bool]:
         )
         logging.info(f"{Fore.GREEN}Botão 'Comprar' clicado com sucesso")
 
-        if _verify_checkout_reached(driver, url_before_click, timeout=20.0):
+        if _verify_checkout_reached(driver, timeout=20.0):
             logging.info(f"{Fore.GREEN}Checkout alcançado: {driver.current_url}")
             return {"cart_ok": True, "checkout_ok": True}
         else:
@@ -304,7 +353,10 @@ def run_audit() -> List[Dict[str, Any]]:
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
 
-    driver = uc.Chrome(options=chrome_options, version_main=146)
+    try:
+        driver = uc.Chrome(options=chrome_options, version_main=146)
+    except Exception:
+        driver = uc.Chrome(options=chrome_options)
     # Metade esquerda da tela em FullHD — deixa o terminal visível na metade direita
     driver.set_window_rect(x=0, y=0, width=960, height=1040)
 
@@ -328,7 +380,8 @@ def run_audit() -> List[Dict[str, Any]]:
             try:
                 if path in BYOB_PAGES:
                     logging.info(f"{Fore.CYAN}Iniciando fluxo BYOB em: {Style.BRIGHT}{path}")
-                    result = add_books_and_buy(driver, quantity=12)
+                    selector = BYOB_SELECTORS.get(path, ".gbbProductAddButton")
+                    result = add_books_and_buy(driver, quantity=12, add_selector=selector)
                     results.append({
                         "url": f"Fluxo BYOB 12 livros + Comprar ({path})",
                         "status": "FUNCIONOU" if result["cart_ok"] else "FALHOU",
@@ -346,9 +399,13 @@ def run_audit() -> List[Dict[str, Any]]:
                     )
                     if buttons:
                         driver.execute_script("arguments[0].click();", buttons[0])
-                        time.sleep(2)
-                        results.append({"url": f"Clique 'Comprar' ({path})", "status": "FUNCIONOU"})
-                        logging.info(f"{Fore.GREEN}Clique executado com sucesso em: {Style.BRIGHT}{path}")
+                        checkout_ok = _cart_to_checkout(driver)
+                        status = "FUNCIONOU" if checkout_ok else "FALHOU"
+                        results.append({"url": f"Checkout ({path})", "status": status})
+                        if checkout_ok:
+                            logging.info(f"{Fore.GREEN}Checkout validado em: {Style.BRIGHT}{path}")
+                        else:
+                            logging.warning(f"{Fore.YELLOW}Checkout não alcançado em: {path}")
                     else:
                         logging.debug(f"Nenhum botão de compra encontrado em: {path}")
             except Exception as e:
@@ -381,9 +438,9 @@ def send_email_report(results: List[Dict[str, Any]]) -> None:
     pages_ok = sum(1 for r in results if str(r.get("status")) in ["200", "FUNCIONOU"])
 
     status_geral = (
-        "Tudo funcionando perfeitamente (Páginas e Carrinho)."
+        "✅ Tudo funcionando perfeitamente (Páginas e Carrinho)."
         if pages_ok == total_pages
-        else "Atenção: Alguma página ou teste falhou."
+        else "⚠️ Atenção: Alguma página ou teste falhou."
     )
 
     html_body = f"""
@@ -397,16 +454,18 @@ def send_email_report(results: List[Dict[str, Any]]) -> None:
     for r in results:
         status_val = str(r.get("status"))
         is_ok = status_val in ["200", "FUNCIONOU"]
-        status_flag = "OK" if is_ok else "ERRO"
+        status_flag = "✅ OK" if is_ok else "❌ ERRO"
         load_time_txt = (
-            f" | {r['load_time_seconds']}s"
+            f" | ⏳ {r['load_time_seconds']}s"
             if "load_time_seconds" in r and r["load_time_seconds"] > 0
             else ""
         )
         text_body += f"- {r['url']}: {status_flag} ({status_val}){load_time_txt}\n"
-        html_body += (
-            f"<li><strong>{r['url']}</strong> — {status_flag} ({status_val}){load_time_txt}</li>"
-        )
+        html_body += f"""
+        <li>
+            <strong>{r['url']}</strong> - {status_flag} ({status_val}){load_time_txt}
+        </li>
+        """
 
     html_body += "</ul>"
 
