@@ -209,6 +209,13 @@ def add_books_and_buy(driver: uc.Chrome, quantity: int = 12, add_selector: str =
     _close_drawer(driver)
     time.sleep(2)
 
+    # Aguarda o React renderizar os botões antes de começar
+    deadline_render = time.time() + 15
+    while time.time() < deadline_render:
+        if driver.find_elements(By.CSS_SELECTOR, add_selector):
+            break
+        time.sleep(1)
+
     initial_count = _read_cart_count(driver)
     logging.info(f"{Fore.CYAN}  Contador inicial do carrinho: {initial_count}")
 
