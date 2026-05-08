@@ -127,7 +127,7 @@ def _verify_checkout_reached(driver: uc.Chrome, timeout: float = 20.0) -> bool:
     return False
 
 
-def _cart_to_checkout(driver: uc.Chrome, timeout: float = 15.0) -> bool:
+def _cart_to_checkout(driver: uc.Chrome, timeout: float = 20.0) -> bool:
     """
     Após um clique de compra, aguarda o caminho para o checkout.
     Suporta dois fluxos:
@@ -144,12 +144,22 @@ def _cart_to_checkout(driver: uc.Chrome, timeout: float = 15.0) -> bool:
     else:
         return False
 
-    checkout_btn = driver.find_elements(By.CSS_SELECTOR, "[name='checkout']")
-    if not checkout_btn:
+    # Aguarda o botão de checkout renderizar — necessário quando a navegação para
+    # /cart é rápida mas o Shopify ainda está hidratando a página do carrinho
+    deadline_btn = time.time() + 10
+    checkout_btn = []
+    while time.time() < deadline_btn:
+        checkout_btn = driver.find_elements(By.CSS_SELECTOR, "[name='checkout']")
+        if checkout_btn:
+            break
         checkout_btn = driver.find_elements(
             By.XPATH,
             "//button[contains(., 'Finalizar') or contains(., 'Confira') or contains(., 'Checkout')]",
         )
+        if checkout_btn:
+            break
+        time.sleep(0.5)
+
     if not checkout_btn:
         return False
 
@@ -398,12 +408,18 @@ def run_audit() -> List[Dict[str, Any]]:
                         "status": "FUNCIONOU" if result["checkout_ok"] else "FALHOU",
                     })
                 else:
-                    # Páginas de conversão simples: clica no primeiro CTA disponível
-                    buttons = driver.find_elements(
-                        By.XPATH,
-                        "//button[contains(., 'Adicionar') or contains(., 'Comprar') "
-                        "or contains(., 'Compre') or contains(., 'Aproveite') or contains(., 'Avançar')]",
-                    )
+                    # Páginas de conversão simples: aguarda React renderizar, clica no CTA e valida checkout
+                    deadline_render = time.time() + 15
+                    buttons = []
+                    while time.time() < deadline_render:
+                        buttons = driver.find_elements(
+                            By.XPATH,
+                            "//button[contains(., 'Adicionar') or contains(., 'Comprar') "
+                            "or contains(., 'Compre') or contains(., 'Aproveite') or contains(., 'Avançar')]",
+                        )
+                        if buttons:
+                            break
+                        time.sleep(1)
                     if buttons:
                         driver.execute_script("arguments[0].click();", buttons[0])
                         checkout_ok = _cart_to_checkout(driver)
@@ -414,7 +430,8 @@ def run_audit() -> List[Dict[str, Any]]:
                         else:
                             logging.warning(f"{Fore.YELLOW}Checkout não alcançado em: {path}")
                     else:
-                        logging.debug(f"Nenhum botão de compra encontrado em: {path}")
+                        logging.warning(f"{Fore.YELLOW}Nenhum botão encontrado em: {path}")
+                        results.append({"url": f"Checkout ({path})", "status": "FALHOU"})
             except Exception as e:
                 logging.warning(f"{Fore.YELLOW}Não foi possível interagir com {path}: {e}")
     finally:
