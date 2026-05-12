@@ -127,44 +127,83 @@ def _verify_checkout_reached(driver: uc.Chrome, timeout: float = 20.0) -> bool:
     return False
 
 
-def _cart_to_checkout(driver: uc.Chrome, timeout: float = 20.0) -> bool:
+def _dispatch_real_click(driver: uc.Chrome, element) -> None:
+    """
+    Dispara mousedown + mouseup + click como MouseEvent real, com coordenadas calculadas.
+    Necessário pra handlers React que ignoram .click() simples por não ser 'trusted event'.
+    """
+    driver.execute_script(
+        "const el = arguments[0];"
+        "el.scrollIntoView({block: 'center', behavior: 'instant'});"
+        "const r = el.getBoundingClientRect();"
+        "const x = r.left + r.width / 2;"
+        "const y = r.top + r.height / 2;"
+        "['mousedown', 'mouseup', 'click'].forEach(t => {"
+        "  el.dispatchEvent(new MouseEvent(t, {"
+        "    bubbles: true, cancelable: true, view: window,"
+        "    clientX: x, clientY: y, button: 0"
+        "  }));"
+        "});",
+        element,
+    )
+
+
+def _find_checkout_button(driver: uc.Chrome):
+    """Procura o botão de checkout em várias variantes que temas Shopify usam."""
+    selectors = [
+        (By.CSS_SELECTOR, "[name='checkout']"),
+        (By.CSS_SELECTOR, "a[href*='/checkout']"),
+        (By.CSS_SELECTOR, "button[href*='/checkout']"),
+        (By.XPATH, "//button[contains(., 'Finalizar') or contains(., 'Confira') or contains(., 'Checkout')]"),
+        (By.XPATH, "//a[contains(., 'Finalizar') or contains(., 'Confira') or contains(., 'Checkout')]"),
+    ]
+    for by, sel in selectors:
+        found = driver.find_elements(by, sel)
+        if found:
+            return found[0]
+    return None
+
+
+def _cart_to_checkout(driver: uc.Chrome, timeout: float = 20.0):
     """
     Após um clique de compra, aguarda o caminho para o checkout.
-    Suporta dois fluxos:
-    - Navegação para /cart (redireciona a página inteira)
-    - Drawer de carrinho (a URL não muda, mas o botão de checkout aparece no DOM)
+    Retorna (success: bool, reason: str) — a reason descreve o que aconteceu para diagnóstico.
+
+    Caminhos suportados:
+    1. CTA com return_to=/checkout — URL vai direto pro checkout
+    2. URL navega pra /cart — precisa clicar no botão Finalizar
+    3. Drawer abre na mesma página — botão de checkout aparece no DOM
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if "/cart" in (driver.current_url or "").lower():
+        url = (driver.current_url or "").lower()
+        if "/checkout" in url or "checkout.shopify" in url:
+            return True, "navegou direto para o checkout"
+        if "/cart" in url:
             break
-        if driver.find_elements(By.CSS_SELECTOR, "[name='checkout']"):
+        if driver.find_elements(By.CSS_SELECTOR, "[name='checkout'], a[href*='/checkout']"):
             break
         time.sleep(0.3)
     else:
-        return False
+        return False, "clique não abriu drawer nem navegou para /cart em 20s"
 
     # Aguarda o botão de checkout renderizar — necessário quando a navegação para
     # /cart é rápida mas o Shopify ainda está hidratando a página do carrinho
     deadline_btn = time.time() + 10
-    checkout_btn = []
+    checkout_btn = None
     while time.time() < deadline_btn:
-        checkout_btn = driver.find_elements(By.CSS_SELECTOR, "[name='checkout']")
-        if checkout_btn:
-            break
-        checkout_btn = driver.find_elements(
-            By.XPATH,
-            "//button[contains(., 'Finalizar') or contains(., 'Confira') or contains(., 'Checkout')]",
-        )
+        checkout_btn = _find_checkout_button(driver)
         if checkout_btn:
             break
         time.sleep(0.5)
 
     if not checkout_btn:
-        return False
+        return False, "carrinho detectado mas botão de Finalizar não renderizou em 10s"
 
-    driver.execute_script("arguments[0].click();", checkout_btn[0])
-    return _verify_checkout_reached(driver, timeout=20.0)
+    _dispatch_real_click(driver, checkout_btn)
+    if _verify_checkout_reached(driver, timeout=20.0):
+        return True, "checkout alcançado via carrinho"
+    return False, "Finalizar foi clicado mas URL não foi para /checkout"
 
 
 def check_page(driver: uc.Chrome, url: str) -> Dict[str, Any]:
@@ -366,14 +405,19 @@ def run_audit() -> List[Dict[str, Any]]:
 
     # undetected-chromedriver patcha o ChromeDriver removendo os indicadores que
     # o Cloudflare Turnstile usa pra bloquear automação (navigator.webdriver, etc.)
-    chrome_options = uc.ChromeOptions()
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
+    def _build_options() -> uc.ChromeOptions:
+        opts = uc.ChromeOptions()
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        return opts
 
+    # Tenta sem fixar versão (uc detecta o Chrome instalado automaticamente).
+    # ChromeOptions não pode ser reutilizado entre tentativas, então recria em cada chamada.
     try:
-        driver = uc.Chrome(options=chrome_options, version_main=146)
+        driver = uc.Chrome(options=_build_options())
     except Exception:
-        driver = uc.Chrome(options=chrome_options)
+        # Fallback: tenta forçar v146 caso a detecção automática falhe
+        driver = uc.Chrome(options=_build_options(), version_main=146)
     # Metade esquerda da tela em FullHD — deixa o terminal visível na metade direita
     driver.set_window_rect(x=0, y=0, width=960, height=1040)
 
@@ -408,30 +452,42 @@ def run_audit() -> List[Dict[str, Any]]:
                         "status": "FUNCIONOU" if result["checkout_ok"] else "FALHOU",
                     })
                 else:
-                    # Páginas de conversão simples: aguarda React renderizar, clica no CTA e valida checkout
+                    # Páginas de conversão simples: aguarda React, clica no CTA e valida checkout.
+                    # XPath cobre <button>, <a> e [role='button'] porque temas customizados
+                    # frequentemente usam links ou divs estilizados em vez de botões nativos.
+                    cta_xpath = (
+                        "//*[(self::button or self::a or @role='button') "
+                        "and (contains(., 'Adicionar') or contains(., 'Comprar') "
+                        "or contains(., 'Compre') or contains(., 'Aproveite') or contains(., 'Avançar'))]"
+                    )
                     deadline_render = time.time() + 15
                     buttons = []
                     while time.time() < deadline_render:
-                        buttons = driver.find_elements(
-                            By.XPATH,
-                            "//button[contains(., 'Adicionar') or contains(., 'Comprar') "
-                            "or contains(., 'Compre') or contains(., 'Aproveite') or contains(., 'Avançar')]",
-                        )
+                        buttons = driver.find_elements(By.XPATH, cta_xpath)
                         if buttons:
                             break
                         time.sleep(1)
                     if buttons:
-                        driver.execute_script("arguments[0].click();", buttons[0])
-                        checkout_ok = _cart_to_checkout(driver)
+                        _dispatch_real_click(driver, buttons[0])
+                        checkout_ok, reason = _cart_to_checkout(driver)
                         status = "FUNCIONOU" if checkout_ok else "FALHOU"
-                        results.append({"url": f"Checkout ({path})", "status": status})
+                        results.append({
+                            "url": f"Checkout ({path})",
+                            "status": status,
+                            "reason": reason,
+                        })
                         if checkout_ok:
-                            logging.info(f"{Fore.GREEN}Checkout validado em: {Style.BRIGHT}{path}")
+                            logging.info(f"{Fore.GREEN}Checkout validado em: {Style.BRIGHT}{path} ({reason})")
                         else:
-                            logging.warning(f"{Fore.YELLOW}Checkout não alcançado em: {path}")
+                            logging.warning(f"{Fore.YELLOW}Checkout não alcançado em {path}: {reason}")
                     else:
-                        logging.warning(f"{Fore.YELLOW}Nenhum botão encontrado em: {path}")
-                        results.append({"url": f"Checkout ({path})", "status": "FALHOU"})
+                        reason = "nenhum CTA (button/a/role=button) com texto Adicionar|Comprar|Compre|Aproveite|Avançar encontrado em 15s"
+                        logging.warning(f"{Fore.YELLOW}{reason} em: {path}")
+                        results.append({
+                            "url": f"Checkout ({path})",
+                            "status": "FALHOU",
+                            "reason": reason,
+                        })
             except Exception as e:
                 logging.warning(f"{Fore.YELLOW}Não foi possível interagir com {path}: {e}")
     finally:
@@ -484,10 +540,16 @@ def send_email_report(results: List[Dict[str, Any]]) -> None:
             if "load_time_seconds" in r and r["load_time_seconds"] > 0
             else ""
         )
-        text_body += f"- {r['url']}: {status_flag} ({status_val}){load_time_txt}\n"
+        reason = r.get("reason", "")
+        reason_txt = f"\n    → motivo: {reason}" if reason and not is_ok else ""
+        reason_html = (
+            f"<br><span style='color:#c44; font-style:italic; margin-left:1.5em'>→ motivo: {reason}</span>"
+            if reason and not is_ok else ""
+        )
+        text_body += f"- {r['url']}: {status_flag} ({status_val}){load_time_txt}{reason_txt}\n"
         html_body += f"""
         <li>
-            <strong>{r['url']}</strong> - {status_flag} ({status_val}){load_time_txt}
+            <strong>{r['url']}</strong> - {status_flag} ({status_val}){load_time_txt}{reason_html}
         </li>
         """
 
